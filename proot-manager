@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # ═══════════════════════════════════════════════════════════════
 #  proot-manager  (pmgr)  —  rootless Linux container manager
-#  v1.0.0 · nt-main edition · powered by the statx-fixed proot5
+#  v1.0.0 · single-file rootless container manager · proot >= 5.5.0
 #  Single file. No dependencies beyond curl/tar/python3/crane.
 # ═══════════════════════════════════════════════════════════════
 set -euo pipefail
 
 PM_VERSION="1.0.0"
-PM_HOME="${PM_HOME:-/kaggle/working/proot/pm}"
+PM_HOME="${PM_HOME:-$HOME/.local/share/proot-manager}"
 PM_REG="$PM_HOME/registry"
 PM_SESS="$PM_HOME/sessions"
 PM_STORE="$PM_HOME/containers"
@@ -31,19 +31,12 @@ ensure_layout() { mkdir -p "$PM_REG" "$PM_SESS" "$PM_STORE" "$PM_BACKUP"; }
 valid_name() { [[ "${1:-}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; }
 
 find_bins() {
-  if [ -z "$PROOT_BIN" ]; then
-    local c
-    for c in /kaggle/working/proot/proot5 "$(command -v proot 2>/dev/null || true)"; do
-      if [ -n "$c" ] && [ -x "$c" ]; then PROOT_BIN=$c; break; fi
-    done
-  fi
+  # override via PM_PROOT / PM_CRANE, otherwise PATH lookup
+  [ -n "${PROOT_BIN:-}" ] && [ -x "$PROOT_BIN" ] || PROOT_BIN="$(command -v proot 2>/dev/null || true)"
   [ -n "${PROOT_BIN:-}" ] && [ -x "$PROOT_BIN" ] \
-    || die "proot binary not found — expected /kaggle/working/proot/proot5 (set PM_PROOT to override)"
-  if [ -z "$CRANE_BIN" ]; then
-    local c
-    for c in /kaggle/working/proot/crane "$(command -v crane 2>/dev/null || true)"; do
-      if [ -n "$c" ] && [ -x "$c" ]; then CRANE_BIN=$c; break; fi
-    done
+    || die "proot not found — install proot (>= 5.5.0 recommended) or set PM_PROOT"
+  if [ -z "${CRANE_BIN:-}" ] || [ ! -x "${CRANE_BIN:-}" ]; then
+    CRANE_BIN="$(command -v crane 2>/dev/null || true)"
   fi
 }
 
@@ -87,7 +80,7 @@ sanitize_name() {  # ubuntu:24.04 -> ubuntu ; ghcr.io/a/b:v1 -> b
 # ── commands ──────────────────────────────────────────────────
 
 cmd_version() {
-  echo "${C_B}proot-manager${C_0} v$PM_VERSION  (nt-main edition)"
+  echo "${C_B}proot-manager${C_0} v$PM_VERSION"
   echo "store : $PM_HOME"
   echo "proot : $PROOT_BIN"
   [ -n "$CRANE_BIN" ] && echo "crane : $CRANE_BIN" || echo "crane : not found (image installs unavailable)"
@@ -110,7 +103,7 @@ cmd_list() {
     if session_alive "$name"; then st="${C_G}● live${C_0}"; else st="${C_D}· idle${C_0}"; fi
     printf '  %-16s %-7s %-18b %s\n' "$name" "$size" "$st" "$rf"
   done
-  printf '\n  %s%d container(s)%s   %s\n' "$C_D" "${#mfiles[@]}" "$C_0" "$(df -h /kaggle/working 2>/dev/null | awk 'NR==2{print $4" free on /kaggle/working"}')"
+  printf '\n  %s%d container(s)%s   %s\n' "$C_D" "${#mfiles[@]}" "$C_0" "$(df -h "$PM_HOME" 2>/dev/null | awk 'NR==2{print $4" free on store volume"}')"
 }
 
 cmd_search() {
@@ -198,7 +191,7 @@ cmd_install() {
     meta_set "$name" SOURCE "file://$(readlink -f "$src")"
   else
     # docker/OCI image via crane
-    [ -n "$CRANE_BIN" ] || die "crane not found — needed for image pulls (expected /kaggle/working/proot/crane)"
+    [ -n "$CRANE_BIN" ] || die "crane not found — needed for image pulls (install crane or set PM_CRANE)"
     local ref=$src
     [[ "$ref" == *:* || "$ref" == */*:* ]] || ref="$ref:latest"
     info "pulling image: $ref  (crane export → rootfs)"
@@ -432,7 +425,7 @@ ${C_B}EXAMPLES${C_0}
   proot-manager login ubuntu
   proot-manager copy ./note.txt ubuntu:/root/note.txt
 
-Store: $PM_HOME   ·   proot: statx-fixed v5.5.0
+Store: $PM_HOME   ·   proot >= 5.5.0 recommended (statx-safe)
 EOF
 }
 

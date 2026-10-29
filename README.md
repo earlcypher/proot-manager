@@ -82,7 +82,7 @@ proot-manager backup ubuntu
 ## Store layout
 
 ```
-$PM_HOME/                  default: /kaggle/working/proot/pm
+$PM_HOME/                  default: ~/.local/share/proot-manager
 ├── proot-manager          this script (pmgr → symlink)
 ├── registry/<name>.pm     metadata (ROOTFS, SOURCE, CREATED)
 ├── containers/<name>/     rootfs of installed containers
