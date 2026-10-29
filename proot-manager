@@ -1,0 +1,462 @@
+#!/usr/bin/env bash
+# ═══════════════════════════════════════════════════════════════
+#  proot-manager  (pmgr)  —  rootless Linux container manager
+#  v1.0.0 · nt-main edition · powered by the statx-fixed proot5
+#  Single file. No dependencies beyond curl/tar/python3/crane.
+# ═══════════════════════════════════════════════════════════════
+set -euo pipefail
+
+PM_VERSION="1.0.0"
+PM_HOME="${PM_HOME:-/kaggle/working/proot/pm}"
+PM_REG="$PM_HOME/registry"
+PM_SESS="$PM_HOME/sessions"
+PM_STORE="$PM_HOME/containers"
+PM_BACKUP="$PM_HOME/backups"
+PROOT_BIN="${PM_PROOT:-}"
+CRANE_BIN="${PM_CRANE:-}"
+
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  C_R=$'\033[31m'; C_G=$'\033[32m'; C_Y=$'\033[33m'
+  C_C=$'\033[36m'; C_B=$'\033[1m'; C_D=$'\033[2m'; C_0=$'\033[0m'
+else
+  C_R=''; C_G=''; C_Y=''; C_C=''; C_B=''; C_D=''; C_0=''
+fi
+
+die()  { printf '%s✗%s %s\n' "$C_R" "$C_0" "$*" >&2; exit 1; }
+info() { printf '%s·%s %s\n' "$C_C" "$C_0" "$*"; }
+ok()   { printf '%s✓%s %s\n' "$C_G" "$C_0" "$*"; }
+
+ensure_layout() { mkdir -p "$PM_REG" "$PM_SESS" "$PM_STORE" "$PM_BACKUP"; }
+
+valid_name() { [[ "${1:-}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; }
+
+find_bins() {
+  if [ -z "$PROOT_BIN" ]; then
+    local c
+    for c in /kaggle/working/proot/proot5 "$(command -v proot 2>/dev/null || true)"; do
+      if [ -n "$c" ] && [ -x "$c" ]; then PROOT_BIN=$c; break; fi
+    done
+  fi
+  [ -n "${PROOT_BIN:-}" ] && [ -x "$PROOT_BIN" ] \
+    || die "proot binary not found — expected /kaggle/working/proot/proot5 (set PM_PROOT to override)"
+  if [ -z "$CRANE_BIN" ]; then
+    local c
+    for c in /kaggle/working/proot/crane "$(command -v crane 2>/dev/null || true)"; do
+      if [ -n "$c" ] && [ -x "$c" ]; then CRANE_BIN=$c; break; fi
+    done
+  fi
+}
+
+meta_file() { echo "$PM_REG/$1.pm"; }
+meta_get()  { sed -n "s/^$2=//p" "$(meta_file "$1")" 2>/dev/null | head -1; }
+meta_set()  { local f; f=$(meta_file "$1"); grep -v "^$2=" "$f" 2>/dev/null || true; \
+              { grep -v "^$2=" "$f" 2>/dev/null || true; echo "$2=$3"; } > "$f.tmp"; mv "$f.tmp" "$f"; }
+
+require_container() {
+  valid_name "$1" || die "invalid container name: '${1:-}'"
+  [ -f "$(meta_file "$1")" ] || die "no such container: $1   (try: proot-manager list)"
+}
+rootfs_of() { meta_get "$1" ROOTFS; }
+
+session_alive() {
+  local pidf="$PM_SESS/$1.pid" pid
+  [ -f "$pidf" ] || return 1
+  pid=$(cat "$pidf" 2>/dev/null || echo)
+  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+
+guest_shell() {
+  local r=$1
+  if   [ -x "$r/bin/bash" ]; then echo /bin/bash
+  elif [ -x "$r/bin/sh"  ]; then echo /bin/sh
+  else die "no shell inside $r"; fi
+}
+
+guest_exec() {   # guest_exec <rootfs> <shell-args...>
+  local r=$1; shift
+  exec "$PROOT_BIN" -0 -r "$r" \
+    -b /proc -b /dev -b /sys -b /etc/resolv.conf -b /etc/hosts \
+    -w / "$@"
+}
+
+sanitize_name() {  # ubuntu:24.04 -> ubuntu ; ghcr.io/a/b:v1 -> b
+  local s=${1##*/}; s=${s%%:*}; s=$(echo "$s" | tr -cs 'A-Za-z0-9._-' '-' | sed 's/^-//;s/-$//')
+  echo "${s:-container}"
+}
+
+# ── commands ──────────────────────────────────────────────────
+
+cmd_version() {
+  echo "${C_B}proot-manager${C_0} v$PM_VERSION  (nt-main edition)"
+  echo "store : $PM_HOME"
+  echo "proot : $PROOT_BIN"
+  [ -n "$CRANE_BIN" ] && echo "crane : $CRANE_BIN" || echo "crane : not found (image installs unavailable)"
+}
+
+cmd_list() {
+  shopt -s nullglob
+  local mfiles=("$PM_REG"/*.pm) m name rf size st
+  if [ ${#mfiles[@]} -eq 0 ]; then
+    echo
+    echo "  ${C_D}no containers yet${C_0}"
+    echo "  add one with:  ${C_C}proot-manager install ubuntu:24.04${C_0}"
+    return 0
+  fi
+  printf '\n  %s%-16s %-7s %-8s %s%s\n' "$C_B" "NAME" "SIZE" "SESSION" "ROOTFS" "$C_0"
+  for m in "${mfiles[@]}"; do
+    name=$(basename "$m" .pm)
+    rf=$(meta_get "$name" ROOTFS)
+    size=$(du -sh "$rf" 2>/dev/null | cut -f1 || echo '?')
+    if session_alive "$name"; then st="${C_G}● live${C_0}"; else st="${C_D}· idle${C_0}"; fi
+    printf '  %-16s %-7s %-18b %s\n' "$name" "$size" "$st" "$rf"
+  done
+  printf '\n  %s%d container(s)%s   %s\n' "$C_D" "${#mfiles[@]}" "$C_0" "$(df -h /kaggle/working 2>/dev/null | awk 'NR==2{print $4" free on /kaggle/working"}')"
+}
+
+cmd_search() {
+  local q="${1:-}"; [ -n "$q" ] || die "usage: proot-manager search <query>"
+  info "searching Docker Hub for '$q' …"
+  local out
+  out=$(curl -sfL --max-time 15 \
+      "https://hub.docker.com/v2/search/repositories/?query=$(echo "$q" | sed 's/ /%20/g')&page_size=8" \
+      | python3 -c '
+import json,sys
+try: d=json.load(sys.stdin)
+except Exception: sys.exit(1)
+rs=d.get("results") or []
+if not rs: print("  (no results)"); sys.exit(0)
+for r in rs:
+    name=r.get("repo_name") or r.get("name","?")
+    if r.get("is_official"): name="docker.io/library/"+name+"  [official]"
+    pulls=r.get("pull_count",0)
+    print(f"  {name:<45} pulls={pulls:,}")
+') || die "search unavailable (Docker Hub API unreachable from this network)"
+  echo
+  printf '  %s%s%s\n' "$C_B" "REPOSITORY" "$C_0" >/dev/null
+  echo "$out"
+  echo
+}
+
+cmd_install() {
+  find_bins; ensure_layout
+  local name="" src="" suite="" mirror="" force=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --name) name=${2:?}; shift 2;;
+      --debootstrap) suite=${2:?}; shift 2;;
+      --mirror) mirror=${2:?}; shift 2;;
+      --force) force=1; shift;;
+      -*) die "unknown option: $1";;
+      *) src=$1; shift;;
+    esac
+  done
+  [ -n "$src" ] || die "usage: proot-manager install [--name N] (--debootstrap SUITE [--mirror URL] | IMAGE:TAG | URL | FILE)"
+
+  if [ -n "$suite" ]; then
+    : "${name:=$suite}"
+    local m="${mirror:-http://archive.ubuntu.com/ubuntu}"
+    case "$suite" in trixie|bookworm|bullseye|sid) : "${mirror:=http://deb.debian.org/debian}"; m="${mirror:-http://deb.debian.org/debian}";; esac
+    m="${mirror:-$m}"
+  else
+    : "${name:=$(sanitize_name "$src")}"
+  fi
+  valid_name "$name" || die "bad container name: $name"
+
+  local rf="$PM_STORE/$name"
+  if [ -f "$(meta_file "$name")" ] && [ "$force" -ne 1 ]; then
+    die "container '$name' already exists (use --force to overwrite)"
+  fi
+  [ "$force" -eq 1 ] && cmd_remove_quiet "$name"
+  rm -rf "$rf"; mkdir -p "$rf"
+
+  if [ -n "$suite" ]; then
+    command -v debootstrap >/dev/null || die "debootstrap not installed  →  apt-get install -y debootstrap"
+    info "debootstrap $suite → $name"
+    debootstrap --variant=minbase "$suite" "$rf" "$m" >&2
+    meta_set "$name" SOURCE "debootstrap://$suite $m"
+  elif [[ "$src" == http://* || "$src" == https://* ]]; then
+    info "fetching rootfs archive: $src"
+    local tmp="/tmp/pm-$$.tar" comp=""
+    curl -sfL --max-time 600 -o "$tmp" "$src" || { rm -f "$tmp"; die "download failed: $src"; }
+    case "$src" in
+      *.tar.gz|*.tgz) tar -xzf "$tmp" -C "$rf";;
+      *.tar.xz)       tar -xJf "$tmp" -C "$rf";;
+      *.tar.zst)      tar --zstd -xf "$tmp" -C "$rf";;
+      *.tar)          tar -xf "$tmp" -C "$rf";;
+      *)              tar -xf "$tmp" -C "$rf" 2>/dev/null || { rm -f "$tmp"; die "unsupported archive format: $src"; };;
+    esac
+    rm -f "$tmp"
+    meta_set "$name" SOURCE "url://$src"
+  elif [ -f "$src" ]; then
+    info "importing local archive: $src"
+    case "$src" in
+      *.tar.gz|*.tgz) tar -xzf "$src" -C "$rf";;
+      *.tar.xz)       tar -xJf "$src" -C "$rf";;
+      *.tar.zst)      tar --zstd -xf "$src" -C "$rf";;
+      *)              tar -xf "$src" -C "$rf";;
+    esac
+    meta_set "$name" SOURCE "file://$(readlink -f "$src")"
+  else
+    # docker/OCI image via crane
+    [ -n "$CRANE_BIN" ] || die "crane not found — needed for image pulls (expected /kaggle/working/proot/crane)"
+    local ref=$src
+    [[ "$ref" == *:* || "$ref" == */*:* ]] || ref="$ref:latest"
+    info "pulling image: $ref  (crane export → rootfs)"
+    "$CRANE_BIN" export "$ref" - 2>/tmp/pm-crane.err | tar -C "$rf" -x -f - \
+      || { cat /tmp/pm-crane.err >&2; rm -rf "$rf"; die "image pull failed: $ref"; }
+    meta_set "$name" SOURCE "image://$ref"
+  fi
+
+  meta_set "$name" ROOTFS "$rf"
+  meta_set "$name" CREATED "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  ok "installed: ${C_B}$name${C_0}"
+  info "start shell:  proot-manager login $name"
+}
+
+cmd_import() {
+  ensure_layout
+  local dir="${1:-}" name=""
+  shift || true
+  while [ $# -gt 0 ]; do case "$1" in
+      --name) name=${2:?}; shift 2;; *) die "usage: proot-manager import <rootfs-dir> --name N";; esac; done
+  [ -d "$dir" ] || die "not a directory: ${dir:-<missing>}"
+  dir=$(readlink -f "$dir")
+  : "${name:=$(basename "$dir")}"
+  valid_name "$name" || die "bad container name: $name"
+  [ -f "$(meta_file "$name")" ] && die "name already registered: $name (rename or remove first)"
+  [ -x "$dir/bin/sh" ] || [ -x "$dir/bin/bash" ] || die "no shell found in $dir — not a rootfs?"
+  {
+    echo "ROOTFS=$dir"
+    echo "SOURCE=imported://$dir"
+    echo "CREATED=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  } > "$(meta_file "$name")"
+  ok "adopted: ${C_B}$name${C_0} → $dir"
+}
+
+cmd_login() {
+  find_bins
+  local name="${1:-}"; shift || true
+  local wd="${1:-/}"
+  require_container "$name"
+  local rf; rf=$(rootfs_of "$name")
+  [ -d "$rf" ] || die "rootfs missing: $rf"
+  echo "$$" > "$PM_SESS/$name.pid"
+  local sh; sh=$(guest_shell "$rf")
+  guest_exec "$rf" "$sh" -l
+}
+
+cmd_run() {
+  find_bins
+  local name="${1:-}"; shift || true
+  require_container "$name"
+  [ $# -gt 0 ] || die "usage: proot-manager run <name> <command...>"
+  local rf; rf=$(rootfs_of "$name")
+  local sh; sh=$(guest_shell "$rf")
+  guest_exec "$rf" "$sh" -c "$*"
+}
+
+cmd_ps() {
+  local found=0 pidf name pid
+  shopt -s nullglob
+  for pidf in "$PM_SESS"/*.pid; do
+    name=$(basename "$pidf" .pid); pid=$(cat "$pidf" 2>/dev/null || echo)
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      printf '  %s●%s %-16s pid=%s\n' "$C_G" "$C_0" "$name" "$pid"; found=1
+    else
+      rm -f "$pidf"   # stale
+    fi
+  done
+  [ "$found" -eq 1 ] || echo "  ${C_D}no active sessions${C_0}"
+}
+
+cmd_kill() {
+  local name="${1:-}"; [ -n "$name" ] || die "usage: proot-manager kill <name|all>"
+  if [ "$name" = all ]; then
+    local pidf
+    shopt -s nullglob
+    for pidf in "$PM_SESS"/*.pid; do
+      kill "$(cat "$pidf")" 2>/dev/null || true; rm -f "$pidf"
+    done
+    ok "all sessions closed"; return
+  fi
+  require_container "$name"
+  session_alive "$name" || { rm -f "$PM_SESS/$name.pid"; die "no live session for '$name'"; }
+  kill "$(cat "$PM_SESS/$name.pid")" 2>/dev/null || true
+  rm -f "$PM_SESS/$name.pid"
+  ok "killed session: $name"
+}
+
+cmd_rename() {
+  local old="${1:-}" new="${2:-}"
+  require_container "$old"
+  valid_name "$new" || die "bad new name: $new"
+  [ -f "$(meta_file "$new")" ] && die "target name already exists: $new"
+  local rf; rf=$(rootfs_of "$old")
+  # move rootfs only if it lives inside the manager store
+  if [[ "$rf" == "$PM_STORE/"* ]]; then
+    local nrf="$PM_STORE/$new"
+    mv "$rf" "$nrf"; rf=$nrf
+  fi
+  mv "$(meta_file "$old")" "$(meta_file "$new")"
+  meta_set "$new" ROOTFS "$rf"
+  [ -f "$PM_SESS/$old.pid" ] && mv "$PM_SESS/$old.pid" "$PM_SESS/$new.pid" || true
+  ok "renamed: $old → $new"
+}
+
+cmd_remove_quiet() {   # no prompts — used by --force
+  local name=$1 rf
+  rf=$(rootfs_of "$name" || true)
+  [ -n "$rf" ] && [ -d "$rf" ] && case "$rf" in "$PM_STORE"/*) rm -rf "$rf";; esac
+  rm -f "$(meta_file "$name")" "$PM_SESS/$name.pid"
+}
+
+cmd_remove() {
+  local name="${1:-}" yes=0
+  shift || true
+  [ "${1:-}" = -y ] && yes=1
+  require_container "$name"
+  local rf; rf=$(rootfs_of "$name")
+  local inside=0; case "$rf" in "$PM_STORE"/*) inside=1;; esac
+  if [ "$inside" -ne 1 ] && [ "$yes" -ne 1 ]; then
+    die "rootfs sits OUTSIDE the manager store ($rf) — imported data. Confirm with: proot-manager remove $name -y"
+  fi
+  if [ "$yes" -ne 1 ]; then
+    printf '  delete %s%s%s and its rootfs at %s ? [y/N] ' "$C_B" "$name" "$C_0" "$rf"
+    local a; read -r a || true
+    [[ "$a" =~ ^[Yy] ]] || { echo "  aborted."; exit 1; }
+  fi
+  rm -rf "$rf"
+  rm -f "$(meta_file "$name")" "$PM_SESS/$name.pid"
+  ok "removed: $name"
+}
+
+cmd_reset() {
+  local name="${1:-}" yes=0
+  [ "${2:-}" = -y ] && yes=1
+  require_container "$name"
+  local src; src=$(meta_get "$name" SOURCE)
+  case "$src" in
+    imported://*) die "imported container — reset would destroy foreign data. Re-import instead.";;
+    debootstrap://*)
+      [ "$yes" -eq 1 ] || die "reset destroys '$name'. Confirm: proot-manager reset $name -y"
+      local suite=${src#debootstrap://}; suite=${suite%% *}; local m=${src##* }
+      rm -rf "$(rootfs_of "$name")"; cmd_install --name "$name" --debootstrap "$suite" --mirror "$m";;
+    *)
+      [ "$yes" -eq 1 ] || die "reset destroys '$name'. Confirm: proot-manager reset $name -y"
+      local ref=${src#*://}
+      rm -rf "$(rootfs_of "$name")"; cmd_install --name "$name" "$ref";;
+  esac
+  ok "reset: $name"
+}
+
+cmd_copy() {
+  local a="${1:-}" b="${2:-}"
+  [ -n "$a" ] && [ -n "$b" ] || die "usage: proot-manager copy <src> <dst>   with <name>:<path> on either side"
+  local n d rf
+  if [[ "$a" == *:* && "$a" != /* ]]; then
+    # container path is SOURCE → copy out
+    n=${a%%:*}; d=${a#*:}; require_container "$n"; rf=$(rootfs_of "$n")
+    [ -e "$rf$d" ] || die "no such path in $n: $d"
+    mkdir -p "$(dirname "$b")"
+    cp -a "$rf$d" "$b" && ok "copied ← $n:$d"
+  elif [[ "$b" == *:* && "$b" != /* ]]; then
+    # container path is DESTINATION → copy in
+    n=${b%%:*}; d=${b#*:}; require_container "$n"; rf=$(rootfs_of "$n")
+    [ -e "$a" ] || die "no such local path: $a"
+    mkdir -p "$rf$(dirname "$d")"
+    cp -a "$a" "$rf$d" && ok "copied → $n:$d"
+  else
+    die "one side must be <name>:<path>"
+  fi
+}
+
+cmd_backup() {
+  local name="${1:-}" out=""
+  shift || true
+  [ "${1:-}" = -o ] && { out="${2:?}"; shift 2; }
+  require_container "$name"
+  local rf; rf=$(rootfs_of "$name")
+  : "${out:=$PM_BACKUP/$name-$(date -u +%Y%m%d-%H%M%S).tar.gz}"
+  info "packing $name → $out"
+  tar -C "$(dirname "$rf")" -czf "$out" "$(basename "$rf")"
+  ok "backup: $out ($(du -h "$out" | cut -f1))"
+}
+
+cmd_restore() {
+  local name="${1:-}" file="${2:-}"
+  require_container "$name"
+  [ -f "$file" ] || die "usage: proot-manager restore <name> <backup.tar.gz>"
+  local rf; rf=$(rootfs_of "$name")
+  case "$rf" in "$PM_STORE"/*) :;; *) die "imported container — rootfs outside store; re-import instead.";; esac
+  session_alive "$name" && die "container has a live session — kill it first"
+  rm -rf "$rf"; mkdir -p "$rf"
+  tar -xzf "$file" -C "$(dirname "$rf")"
+  ok "restored: $name ← $file"
+}
+
+cmd_help() {
+  cat <<EOF
+${C_B}proot-manager${C_0} v$PM_VERSION — rootless Linux container manager  (${C_C}pmgr${C_0})
+
+${C_B}USAGE${C_0}
+  proot-manager <command> [arguments]
+
+${C_B}CONTAINERS${C_0}
+  ${C_C}list${C_0}                       show containers, sizes, live sessions          (ls)
+  ${C_C}install${C_0} [src] [--name N]   IMAGE:TAG | URL | local-file |
+                        --debootstrap SUITE [--mirror URL]        (add)
+  ${C_C}import${C_0} <dir> --name N      adopt an existing rootfs directory
+  ${C_C}login${C_0} <name> [dir]         interactive shell inside container
+  ${C_C}run${C_0} <name> <cmd...>        one-shot command
+  ${C_C}remove${C_0} <name> [-y]         delete container + rootfs        (rm)
+  ${C_C}rename${C_0} <old> <new>         rename a container
+  ${C_C}reset${C_0} <name> -y            rebuild from its recorded source
+
+${C_B}SESSIONS${C_0}
+  ${C_C}ps${C_0}                         live sessions
+  ${C_C}kill${C_0} <name|all>            end session(s)
+
+${C_B}FILES${C_0}
+  ${C_C}copy${C_0} <loc> <name:dst>      copy into/out of a container
+  ${C_C}backup${C_0} <name> [-o file]    tar snapshot
+  ${C_C}restore${C_0} <name> <file>      restore snapshot
+
+${C_B}DISCOVERY${C_0}
+  ${C_C}search${C_0} <query>             search Docker Hub
+  ${C_C}version${C_0}                    store paths & toolchain
+  ${C_C}help${C_0}                       this screen
+
+${C_B}EXAMPLES${C_0}
+  proot-manager install ubuntu:24.04 --name ubuntu
+  proot-manager install --name deb --debootstrap trixie --mirror http://deb.debian.org/debian
+  proot-manager login ubuntu
+  proot-manager copy ./note.txt ubuntu:/root/note.txt
+
+Store: $PM_HOME   ·   proot: statx-fixed v5.5.0
+EOF
+}
+
+# ── dispatch ──────────────────────────────────────────────────
+ensure_layout
+find_bins 2>/dev/null || true
+
+cmd="${1:-help}"; shift || true
+case "$cmd" in
+  help|-h|--help)        cmd_help;;
+  version|-V|--version)  cmd_version;;
+  list|ls)               cmd_list;;
+  search)                cmd_search "$@";;
+  install|add|i|in|ins)  cmd_install "$@";;
+  import)                cmd_import "$@";;
+  login|shell|sh)        cmd_login "$@";;
+  run|exec)              cmd_run "$@";;
+  ps)                    cmd_ps;;
+  kill|stop)             cmd_kill "$@";;
+  rename|mv)             cmd_rename "$@";;
+  remove|rm|delete)      cmd_remove "$@";;
+  reset)                 cmd_reset "$@";;
+  copy|cp)               cmd_copy "$@";;
+  backup)                cmd_backup "$@";;
+  restore)               cmd_restore "$@";;
+  *) die "unknown command: $cmd   (proot-manager help)";;
+esac
