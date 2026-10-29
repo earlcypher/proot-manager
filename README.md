@@ -93,5 +93,3 @@ $PM_HOME/                  default: /kaggle/working/proot/pm
 Overrides: `PM_HOME`, `PM_PROOT`, `PM_CRANE`, `NO_COLOR`.
 
 ---
-
-nt-main edition · tested on Kaggle with proot v5.5.0 + crane vendored on `/kaggle/working`
